@@ -1,82 +1,68 @@
 # rmcp
 
+> A CLI-native MCP client that loads tool schemas on-demand and keeps them out of your context window.
+
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub stars](https://img.shields.io/github/stars/weibaohui/rmcp?style=social)](https://github.com/weibaohui/rmcp)
 
-A CLI-native MCP (Model Context Protocol) client that loads tool schemas on-demand and resolves discover-then-call into a single invocation — keeping tool definitions out of your context window.
+`rmcp` is a Rust implementation of [mcp2cli](https://github.com/weibaohui/mcp2cli), providing a lightweight, token-efficient way to interact with [Model Context Protocol](https://modelcontextprotocol.io/) servers directly from your terminal.
 
-This is a Rust implementation of [mcp2cli](https://github.com/weibaohui/mcp2cli), following **DDD (Domain-Driven Design)** architecture principles.
+## Why rmcp?
+
+When using MCP servers directly, tool schemas consume valuable context tokens — even when you're not using most of them. `rmcp` solves this by **discover-then-call** in a single invocation, loading tool definitions on-demand and discarding them after use.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Direct MCP Usage                                           │
+│  ┌─────────────┐                                            │
+│  │ Tool Schema │  ← Always in context (~500-1000 tokens)     │
+│  │ Tool Schema │  ← Always in context                       │
+│  │ Tool Schema │  ← Always in context                       │
+│  │ Tool Schema │  ← Always in context                       │
+│  └─────────────┘                                            │
+│                           vs                                 │
+│  rmcp Usage                                                 │
+│  ┌─────────────┐                                            │
+│  │ Call Tool  │  ← Schema loaded only when called (~100 tokens)│
+│  └─────────────┘                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Scenario | Direct MCP | rmcp | Savings |
+|----------|-----------|------|---------|
+| Discover 1 tool | ~500 tokens | ~100 tokens | **80%** |
+| Call 1 tool | ~300 tokens | ~130 tokens | **57%** |
+| 10-tool server | ~10,000 tokens | 0 tokens | **100%** |
+| Full workflow | ~2,000 tokens | ~230 tokens | **89%** |
 
 ## Features
 
-- 🔧 **Multi-Transport Support**: SSE, Streamable HTTP, and Stdio transports
-- 🔐 **OAuth 2.1 + PKCE**: Built-in authentication support
-- 📝 **Flexible Parameter Input**: Key=value, YAML inline, YAML file, or stdin pipe
-- 🖥️ **Interactive REPL Mode**: Explore and call tools interactively
-- 📤 **Multiple Output Formats**: JSON, YAML, and compact text
-- 🔍 **Tool Discovery**: List tools, show tool details with parameter schemas
-- ⚡ **Streaming Support**: Stream text content for long-running tools
-- 🎯 **Token Efficient**: 80-90% fewer tokens compared to direct MCP usage
+| Feature | Description |
+|---------|-------------|
+| 🚀 **Multi-Transport** | SSE, Streamable HTTP, and Stdio transports |
+| 🔐 **OAuth 2.1 + PKCE** | Built-in authentication support |
+| 📝 **Flexible Params** | `key=value`, inline YAML, YAML file, or stdin pipe |
+| 🖥️ **Interactive REPL** | Explore servers and call tools interactively |
+| 📤 **Multiple Outputs** | JSON, YAML, and human-readable text formats |
+| ⚡ **Streaming** | Stream text content for long-running operations |
+| 🎯 **Token Efficient** | 80-90% fewer tokens than direct MCP usage |
 
-## Architecture
+## Quick Start
 
-This project follows **Domain-Driven Design (DDD)** architecture:
-
-```
-rmcp/
-├── src/
-│   ├── domain/           # Core business logic
-│   │   ├── entities/     # Domain entities (Server, Tool, etc.)
-│   │   ├── value_objects/# Value objects (TransportType, etc.)
-│   │   ├── errors/       # Domain errors
-│   │   ├── services/     # Domain services
-│   │   └── repositories/ # Repository interfaces
-│   ├── application/      # Application layer
-│   │   ├── dto/          # Data Transfer Objects
-│   │   ├── ports/        # Interface definitions
-│   │   └── use_cases/    # Use cases / Interactors
-│   ├── infrastructure/   # Infrastructure implementations
-│   │   ├── config/       # Configuration repository
-│   │   ├── transport/    # HTTP/Stdio transports
-│   │   ├── mcp_client/   # MCP client implementation
-│   │   ├── oauth/        # OAuth service
-│   │   ├── output/       # Output formatting
-│   │   └── param_parser/ # Parameter parsing
-│   └── presentation/     # CLI presentation layer
-│       ├── cli/          # CLI argument parsing
-│       ├── commands/     # Command handlers
-│       └── interactive/  # REPL mode
-```
-
-## Installation
-
-### From Source
+### Installation
 
 ```bash
+# Build from source
 git clone https://github.com/weibaohui/rmcp.git
 cd rmcp
 cargo build --release
-
-# Binary will be at target/release/rmcp
-cp target/release/rmcp /usr/local/bin/
+sudo cp target/release/rmcp /usr/local/bin/
 ```
 
-### Prerequisites
+### Configuration
 
-- Rust 1.85 or higher
-- For OAuth support: A web browser for authentication flow
-
-## Configuration
-
-Create a configuration file at one of these locations (in order of priority):
-
-1. `~/.config/modelcontextprotocol/mcp.json`
-2. `~/.config/mcp/config.json`
-3. `./mcp.json`
-4. `./.mcp/config.json`
-5. `/etc/mcp/config.json`
-
-### Example Configuration
+Create `~/.config/modelcontextprotocol/mcp.json`:
 
 ```json
 {
@@ -93,7 +79,129 @@ Create a configuration file at one of these locations (in order of priority):
       "headers": {
         "Authorization": "Bearer ${API_TOKEN}"
       }
-    },
+    }
+  }
+}
+```
+
+Configuration file search order (first found wins):
+1. `~/.config/modelcontextprotocol/mcp.json`
+2. `~/.config/mcp/config.json`
+3. `./mcp.json`
+4. `./.mcp/config.json`
+5. `/etc/mcp/config.json`
+
+### Usage
+
+```bash
+# List all configured servers
+rmcp
+
+# List tools on a server
+rmcp openDeepWiki
+
+# Show tool details
+rmcp openDeepWiki list_repositories
+
+# Call a tool with simple args (strings by default)
+rmcp openDeepWiki list_repositories limit=3
+
+# Call with typed arguments
+rmcp openDeepWiki list_repositories limit:number=3 enabled:bool=true
+
+# Call with inline YAML
+rmcp openDeepWiki list_repositories --yaml 'limit: 3 repoOwner: github'
+
+# Call with YAML from file
+rmcp openDeepWiki create_issue -f issue.yaml
+
+# Pipe YAML to stdin
+cat issue.yaml | rmcp openDeepWiki create_issue
+
+# Stream long-running tool output
+rmcp --stream openDeepWiki long_running_tool
+
+# Output in different formats
+rmcp --output yaml openDeepWiki list_repositories
+rmcp --output text openDeepWiki list_repositories
+```
+
+### Interactive Mode
+
+```bash
+rmcp interactive
+```
+
+```
+MCP Interactive Mode
+Type 'help' for available commands, 'exit' to quit
+
+> servers                                    # List all servers
+> use openDeepWiki                           # Set default server
+> tool                                       # List tools on default server
+> list_repositories limit=5                  # Call tool directly
+> tool list_repositories                     # Show tool details
+> exit
+```
+
+## Architecture
+
+`rmcp` follows **Domain-Driven Design (DDD)** principles:
+
+```
+rmcp/src/
+├── domain/           # Core business logic
+│   ├── entities/     # Server, Tool, etc.
+│   ├── value_objects/# TransportType, etc.
+│   ├── errors/       # Domain errors
+│   ├── services/     # Domain services
+│   └── repositories/ # Repository traits
+├── application/      # Application layer
+│   ├── dto/          # Data Transfer Objects
+│   ├── ports/        # Interface definitions
+│   └── use_cases/    # Business use cases
+├── infrastructure/   # External implementations
+│   ├── config/       # File-based config
+│   ├── transport/    # HTTP/Stdio transports
+│   ├── mcp_client/   # MCP protocol client
+│   ├── oauth/        # OAuth 2.1 + PKCE
+│   ├── output/       # JSON/YAML/Text formatting
+│   └── param_parser/ # CLI argument parsing
+└── presentation/     # CLI interface
+    ├── cli/          # Clap argument parsing
+    ├── commands/     # Command handlers
+    └── interactive/  # REPL implementation
+```
+
+## Transport Types
+
+### Streamable HTTP (Default)
+```json
+{ "mcpServers": { "my-server": { "url": "https://example.com/mcp" } } }
+```
+
+### SSE (Server-Sent Events)
+```json
+{ "mcpServers": { "sse-server": { "url": "https://example.com/mcp/sse", "transport": "sse" } } }
+```
+
+### Stdio (Command-based)
+```json
+{
+  "mcpServers": {
+    "stdio-server": {
+      "command": "mcp-server",
+      "args": ["--stdio"],
+      "env": { "API_KEY": "secret" }
+    }
+  }
+}
+```
+
+### OAuth 2.1 + PKCE
+```json
+{
+  "mcpServers": {
     "oauth-server": {
       "url": "https://api.example.com/mcp",
       "auth": {
@@ -109,166 +217,20 @@ Create a configuration file at one of these locations (in order of priority):
 }
 ```
 
-## Usage
-
-### List Servers
-
-```bash
-rmcp
-```
-
-### List Tools on a Server
-
-```bash
-rmcp <server>
-```
-
-### Show Tool Details
-
-```bash
-rmcp <server> <tool>
-```
-
-### Call a Tool
-
-```bash
-# Simple key=value (string by default)
-rmcp server tool name=John age=30
-
-# Typed key:type=value
-rmcp server tool name:string=John age:number=30 enabled:bool=true
-
-# Inline YAML
-rmcp server tool --yaml 'name: John details: {age: 30, city: NYC}'
-
-# YAML from file
-rmcp server tool -f params.yaml
-
-# Pipe YAML to stdin
-cat params.yaml | rmcp server tool
-```
-
-### Output Formats
-
-```bash
-# JSON (default)
-rmcp server tool
-
-# YAML
-rmcp --output yaml server tool
-
-# Compact text
-rmcp --output text server tool
-```
-
-### Interactive Mode
-
-```bash
-rmcp interactive
-```
-
-Or simply:
-
-```bash
-rmcp interactive
-```
-
-Interactive commands:
-- `servers` - List all configured servers
-- `use <server>` - Set default server
-- `tool [name]` - List tools or show tool details
-- `help` - Show help
-- `exit` - Exit interactive mode
-
-## Transport Types
-
-### Streamable HTTP (Default)
-
-```json
-{
-  "mcpServers": {
-    "my-server": {
-      "url": "https://example.com/mcp"
-    }
-  }
-}
-```
-
-### SSE (Server-Sent Events)
-
-```json
-{
-  "mcpServers": {
-    "sse-server": {
-      "url": "https://example.com/mcp/sse",
-      "transport": "sse"
-    }
-  }
-}
-```
-
-### Stdio (Command-based)
-
-```json
-{
-  "mcpServers": {
-    "stdio-server": {
-      "command": "mcp-server",
-      "args": ["--stdio"],
-      "env": {
-        "API_KEY": "secret"
-      }
-    }
-  }
-}
-```
-
-## Environment Variables
-
-Environment variables can be used in configuration:
-
-```json
-{
-  "mcpServers": {
-    "my-server": {
-      "url": "https://api.example.com",
-      "headers": {
-        "Authorization": "Bearer ${API_TOKEN}"
-      }
-    }
-  }
-}
-```
-
-Both `${VAR}` and `$VAR` syntax are supported.
-
-## Comparison with Direct MCP
-
-| Scenario | Direct MCP | rmcp | Saving |
-|----------|-----------|------|--------|
-| Discover 1 tool | ~500 tokens | ~100 tokens | 80% |
-| Call 1 tool | ~300 tokens | ~130 tokens | 57% |
-| 10-tool server in context | ~10,000 tokens | 0 tokens | 100% |
-| Full workflow (discover + call) | ~2,000 tokens | ~230 tokens | 89% |
-
 ## Development
 
-### Build
-
 ```bash
+# Build
 cargo build --release
-```
 
-### Test
-
-```bash
+# Run tests
 cargo test
-```
 
-### Run with Logging
+# Run with debug logging
+RUST_LOG=debug cargo run -- openDeepWiki list_repositories
 
-```bash
-RUST_LOG=debug cargo run
+# Auto-fix warnings
+cargo fix --bin rmcp -p rmcp
 ```
 
 ## License
@@ -277,4 +239,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-This project is a Rust reimplementation of [mcp2cli](https://github.com/weibaohui/mcp2cli) by [weibaohui](https://github.com/weibaohui).
+- [mcp2cli](https://github.com/weibaohui/mcp2cli) - Original Go implementation by [weibaohui](https://github.com/weibaohui)
+- [Model Context Protocol](https://modelcontextprotocol.io/) - The protocol specification
