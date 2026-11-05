@@ -70,6 +70,7 @@ pub struct HttpTransport {
     transport_type: TransportType,
     headers: HeaderMap,
     request_id: u64,
+    session_id: Option<String>,
 }
 
 impl HttpTransport {
@@ -89,18 +90,104 @@ impl HttpTransport {
             }
         }
 
+        // Streamable HTTP servers require the client to accept both
+        // content types; without this they answer 406 Not Acceptable.
+        if !header_map.contains_key(reqwest::header::ACCEPT) {
+            header_map.insert(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static(
+                    "application/json, text/event-stream",
+                ),
+            );
+        }
+
         Self {
             client: HttpClient::new(),
             endpoint,
             transport_type,
             headers: header_map,
             request_id: 0,
+            session_id: None,
         }
     }
 
     fn next_id(&mut self) -> u64 {
         self.request_id += 1;
         self.request_id
+    }
+
+    fn request_url(&self) -> String {
+        if self.transport_type == TransportType::Sse {
+            format!("{}/message", self.endpoint)
+        } else {
+            self.endpoint.clone()
+        }
+    }
+
+    /// Send one JSON-RPC payload, echoing the session id once known.
+    async fn send(&self, body: &serde_json::Value) -> MCPResult<reqwest::Response> {
+        let mut req = self
+            .client
+            .post(self.request_url())
+            .headers(self.headers.clone())
+            .json(body)
+            .timeout(Duration::from_secs(60));
+
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+
+        req.send()
+            .await
+            .map_err(|e| MCPError::transport_error(format!("HTTP request failed: {}", e)))
+    }
+
+    /// Remember the session id handed out by the server, if any.
+    fn update_session(&mut self, response: &reqwest::Response) {
+        if let Some(value) = response.headers().get("mcp-session-id") {
+            if let Ok(sid) = value.to_str() {
+                if !sid.is_empty() {
+                    self.session_id = Some(sid.to_string());
+                }
+            }
+        }
+    }
+
+    /// Extract the JSON-RPC payload from a response body, which may be
+    /// plain JSON or a `text/event-stream` (SSE) stream.
+    fn extract_payload(text: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.starts_with('{') {
+            return trimmed.to_string();
+        }
+
+        // SSE: collect the `data:` lines. A stream may carry server
+        // notifications before the actual response, so prefer the last
+        // payload that looks like a JSON-RPC result/error message.
+        let payloads: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(|data| data.trim())
+            .filter(|data| !data.is_empty())
+            .collect();
+
+        if let Some(payload) = payloads
+            .iter()
+            .rev()
+            .find(|data| data.contains("\"result\"") || data.contains("\"error\""))
+        {
+            return payload.to_string();
+        }
+
+        payloads
+            .last()
+            .map(|data| data.to_string())
+            .unwrap_or_else(|| trimmed.to_string())
+    }
+
+    fn is_session_not_ready(body: &str) -> bool {
+        let lower = body.to_lowercase();
+        lower.contains("missing session id") || lower.contains("session not found")
     }
 
     pub async fn request<Req, Res>(&mut self, method: &str, params: Req) -> MCPResult<Res>
@@ -110,50 +197,122 @@ impl HttpTransport {
     {
         let id = self.next_id();
         let request = JsonRpcRequest::new(id, method, params);
-
-        let url = if self.transport_type == TransportType::Sse {
-            format!("{}/message", self.endpoint)
-        } else {
-            self.endpoint.clone()
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.headers.clone())
-            .json(&request)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .map_err(|e| MCPError::transport_error(format!("HTTP request failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_default();
-            return Err(MCPError::transport_error(format!(
-                "HTTP error {}: {}",
-                status, body
-            )));
-        }
-
-        let rpc_response: JsonRpcResponse<Res> = response.json().await.map_err(|e| {
-            MCPError::transport_error(format!("Failed to parse response: {}", e))
+        let body = serde_json::to_value(&request).map_err(|e| {
+            MCPError::transport_error(format!("Failed to serialize request: {}", e))
         })?;
 
-        match rpc_response.result {
-            JsonRpcResult::Result(result) => Ok(result),
-            JsonRpcResult::Error(err) => Err(MCPError::transport_error(format!(
-                "RPC error {}: {}",
-                err.code, err.message
-            ))),
+        // A server may answer "Missing session ID" / "Session not found"
+        // while the session created by initialize() is still being
+        // registered, so retry briefly instead of failing the call.
+        const MAX_ATTEMPTS: u32 = 8;
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = self.send(&body).await?;
+            self.update_session(&response);
+
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+
+            if !status.is_success() {
+                if Self::is_session_not_ready(&text) && attempt + 1 < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1)))
+                        .await;
+                    continue;
+                }
+                return Err(MCPError::transport_error(format!(
+                    "HTTP error {}: {}",
+                    status, text
+                )));
+            }
+
+            let payload = Self::extract_payload(&text);
+            let rpc_response: JsonRpcResponse<Res> =
+                serde_json::from_str(&payload).map_err(|e| {
+                    MCPError::transport_error(format!("Failed to parse response: {}", e))
+                })?;
+
+            return match rpc_response.result {
+                JsonRpcResult::Result(result) => Ok(result),
+                JsonRpcResult::Error(err) => Err(MCPError::transport_error(format!(
+                    "RPC error {}: {}",
+                    err.code, err.message
+                ))),
+            };
         }
+
+        Err(MCPError::transport_error(
+            "Session did not become ready in time",
+        ))
     }
 
     pub async fn initialize(&mut self) -> MCPResult<()> {
-        // For HTTP transports, connection is stateless
+        // Only Streamable HTTP has a session lifecycle. SSE keeps the
+        // previous behaviour and stdio only spawns the process.
+        if self.transport_type != TransportType::Streamable {
+            return Ok(());
+        }
+
+        // 1) initialize must be the first interaction; the server hands
+        //    out the session id in a response header.
+        let id = self.next_id();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "rmcp",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+
+        let response = self.send(&body).await?;
+        self.update_session(&response);
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(MCPError::transport_error(format!(
+                "HTTP error {}: {}",
+                status, text
+            )));
+        }
+
+        let payload = Self::extract_payload(&text);
+        if !payload.is_empty() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                if let Some(err) = value.get("error") {
+                    let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                    let message = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(MCPError::transport_error(format!(
+                        "RPC error {}: {}",
+                        code, message
+                    )));
+                }
+            }
+        }
+
+        // 2) Tell the server the client is ready (notification, no id),
+        //    echoing the session id via send().
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
+        let response = self.send(&notification).await?;
+        self.update_session(&response);
+        // Servers answer 202 Accepted with an empty body; the exact
+        // status is not significant, so just drain the body.
+        let _ = response.text().await;
+
+        // 3) Give the server a moment to register the session before
+        //    the first real request goes out.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
         Ok(())
     }
 
@@ -348,5 +507,64 @@ mod tests {
             None,
         );
         assert!(transport.is_connected());
+        assert!(transport.session_id.is_none());
+    }
+
+    #[test]
+    fn test_http_transport_adds_accept_header() {
+        let transport = HttpTransport::new(
+            "http://example.com".to_string(),
+            TransportType::Streamable,
+            None,
+        );
+        assert_eq!(
+            transport.headers.get(reqwest::header::ACCEPT).unwrap(),
+            "application/json, text/event-stream"
+        );
+    }
+
+    #[test]
+    fn test_http_transport_keeps_configured_accept_header() {
+        let mut headers = HashMap::new();
+        headers.insert("Accept".to_string(), "application/json".to_string());
+        let transport = HttpTransport::new(
+            "http://example.com".to_string(),
+            TransportType::Streamable,
+            Some(headers),
+        );
+        assert_eq!(
+            transport.headers.get(reqwest::header::ACCEPT).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_extract_payload_plain_json() {
+        let payload = HttpTransport::extract_payload("  {\"jsonrpc\":\"2.0\"}  ");
+        assert_eq!(payload, "{\"jsonrpc\":\"2.0\"}");
+    }
+
+    #[test]
+    fn test_extract_payload_sse() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        let payload = HttpTransport::extract_payload(body);
+        assert_eq!(payload, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    }
+
+    #[test]
+    fn test_extract_payload_sse_skips_notifications() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n";
+        let payload = HttpTransport::extract_payload(body);
+        assert!(payload.contains("\"result\""));
+        assert!(payload.contains("\"id\":2"));
+    }
+
+    #[test]
+    fn test_is_session_not_ready() {
+        assert!(HttpTransport::is_session_not_ready(
+            "Bad Request: Missing session ID"
+        ));
+        assert!(HttpTransport::is_session_not_ready("Session not found"));
+        assert!(!HttpTransport::is_session_not_ready("some other error"));
     }
 }

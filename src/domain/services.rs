@@ -106,18 +106,16 @@ impl ParamParser {
     /// Parse YAML string to parameters
     pub fn parse_yaml(yaml_str: &str) -> MCPResult<HashMap<String, serde_json::Value>> {
         let trimmed = yaml_str.trim();
+        // Empty input means "no parameters" (e.g. a no-argument tool call
+        // in a non-TTY environment), not an error.
         if trimmed.is_empty() {
-            return Err(MCPError::param_invalid("empty YAML input"));
+            return Ok(HashMap::new());
         }
 
         let result: HashMap<String, serde_json::Value> =
             serde_yaml::from_str(trimmed).map_err(|e| {
                 MCPError::param_invalid(format!("invalid YAML: {}", e))
             })?;
-
-        if result.is_empty() {
-            return Err(MCPError::param_invalid("empty YAML input"));
-        }
 
         Ok(result)
     }
@@ -420,6 +418,13 @@ mod tests {
         let result = ParamParser::parse_yaml(yaml).unwrap();
         assert_eq!(result.get("name"), Some(&serde_json::json!("John")));
         assert_eq!(result.get("age"), Some(&serde_json::json!(30)));
+    }
+
+    #[test]
+    fn test_parse_yaml_empty_is_no_params() {
+        assert!(ParamParser::parse_yaml("").unwrap().is_empty());
+        assert!(ParamParser::parse_yaml("  \n ").unwrap().is_empty());
+        assert!(ParamParser::parse_yaml("{}").unwrap().is_empty());
     }
 
     #[test]
