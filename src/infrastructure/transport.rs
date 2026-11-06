@@ -71,6 +71,7 @@ pub struct HttpTransport {
     headers: HeaderMap,
     request_id: u64,
     session_id: Option<String>,
+    protocol_version: Option<String>,
 }
 
 impl HttpTransport {
@@ -108,6 +109,7 @@ impl HttpTransport {
             headers: header_map,
             request_id: 0,
             session_id: None,
+            protocol_version: None,
         }
     }
 
@@ -124,7 +126,8 @@ impl HttpTransport {
         }
     }
 
-    /// Send one JSON-RPC payload, echoing the session id once known.
+    /// Send one JSON-RPC payload, echoing the session id and the
+    /// negotiated protocol version once known.
     async fn send(&self, body: &serde_json::Value) -> MCPResult<reqwest::Response> {
         let mut req = self
             .client
@@ -135,6 +138,10 @@ impl HttpTransport {
 
         if let Some(sid) = &self.session_id {
             req = req.header("Mcp-Session-Id", sid);
+        }
+
+        if let Some(version) = &self.protocol_version {
+            req = req.header("MCP-Protocol-Version", version);
         }
 
         req.send()
@@ -190,6 +197,16 @@ impl HttpTransport {
         lower.contains("missing session id") || lower.contains("session not found")
     }
 
+    /// Read the protocol version the server agreed to in its initialize
+    /// result, if the response is parseable and carries one.
+    fn negotiated_version(payload: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(payload)
+            .ok()?
+            .pointer("/result/protocolVersion")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
     pub async fn request<Req, Res>(&mut self, method: &str, params: Req) -> MCPResult<Res>
     where
         Req: Serialize + Send,
@@ -201,10 +218,11 @@ impl HttpTransport {
             MCPError::transport_error(format!("Failed to serialize request: {}", e))
         })?;
 
-        // A server may answer "Missing session ID" / "Session not found"
-        // while the session created by initialize() is still being
-        // registered, so retry briefly instead of failing the call.
-        const MAX_ATTEMPTS: u32 = 8;
+        // A session may be rejected because it is still being registered
+        // or has expired. Per spec a 404 means the client must
+        // re-initialize, so re-run the handshake to get a fresh session
+        // instead of retrying with a session the server already lost.
+        const MAX_ATTEMPTS: u32 = 3;
         for attempt in 0..MAX_ATTEMPTS {
             let response = self.send(&body).await?;
             self.update_session(&response);
@@ -214,8 +232,9 @@ impl HttpTransport {
 
             if !status.is_success() {
                 if Self::is_session_not_ready(&text) && attempt + 1 < MAX_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1)))
-                        .await;
+                    self.session_id = None;
+                    self.initialize().await?;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
                 return Err(MCPError::transport_error(format!(
@@ -240,7 +259,7 @@ impl HttpTransport {
         }
 
         Err(MCPError::transport_error(
-            "Session did not become ready in time",
+            "Session did not become ready after re-initialization attempts",
         ))
     }
 
@@ -252,14 +271,17 @@ impl HttpTransport {
         }
 
         // 1) initialize must be the first interaction; the server hands
-        //    out the session id in a response header.
+        //    out the session id in a response header. Streamable HTTP was
+        //    introduced in protocol revision 2025-03-26, so announce that
+        //    version — 2024-11-05 predates it and a strict server may
+        //    reject the handshake.
         let id = self.next_id();
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {
                     "name": "rmcp",
@@ -294,6 +316,17 @@ impl HttpTransport {
                         code, message
                     )));
                 }
+
+                // Remember the version the server agreed to and echo it on
+                // later requests (required by revision 2025-06-18, ignored
+                // by older servers). A server that omits it is
+                // non-conformant but tolerated.
+                if let Some(version) = value
+                    .pointer("/result/protocolVersion")
+                    .and_then(|v| v.as_str())
+                {
+                    self.protocol_version = Some(version.to_string());
+                }
             }
         }
 
@@ -308,10 +341,6 @@ impl HttpTransport {
         // Servers answer 202 Accepted with an empty body; the exact
         // status is not significant, so just drain the body.
         let _ = response.text().await;
-
-        // 3) Give the server a moment to register the session before
-        //    the first real request goes out.
-        tokio::time::sleep(Duration::from_millis(600)).await;
 
         Ok(())
     }
@@ -566,5 +595,18 @@ mod tests {
         ));
         assert!(HttpTransport::is_session_not_ready("Session not found"));
         assert!(!HttpTransport::is_session_not_ready("some other error"));
+    }
+
+    #[test]
+    fn test_negotiated_version() {
+        let payload = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"1.0"}}}"#;
+        assert_eq!(
+            HttpTransport::negotiated_version(payload).as_deref(),
+            Some("2025-03-26")
+        );
+        // No protocolVersion in the result: tolerated, no version echoed.
+        assert!(HttpTransport::negotiated_version(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_none());
+        // Unparseable payload: no version echoed.
+        assert!(HttpTransport::negotiated_version("not json").is_none());
     }
 }
