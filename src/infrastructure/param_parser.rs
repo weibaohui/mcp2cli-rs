@@ -74,8 +74,11 @@ pub fn read_stdin_yaml() -> MCPResult<HashMap<String, serde_json::Value>> {
         .read_to_string(&mut data)
         .map_err(|e| MCPError::param_invalid(format!("Failed to read stdin: {}", e)))?;
 
+    // Empty stdin is common in non-TTY environments (agents, CI) where a
+    // no-argument tool call still looks like piped input. Treat it as
+    // "no parameters" instead of failing the call.
     if data.trim().is_empty() {
-        return Err(MCPError::param_invalid("empty stdin input"));
+        return Ok(HashMap::new());
     }
 
     ParamParser::parse_yaml(&data)
@@ -107,5 +110,12 @@ mod tests {
         let result = parser.parse_yaml(yaml).unwrap();
         assert_eq!(result.get("name"), Some(&serde_json::json!("John")));
         assert_eq!(result.get("age"), Some(&serde_json::json!(30)));
+    }
+
+    #[test]
+    fn test_parse_yaml_empty_is_no_params() {
+        let parser = CliParamParser::new();
+        assert!(parser.parse_yaml("").unwrap().is_empty());
+        assert!(parser.parse_yaml("  \n ").unwrap().is_empty());
     }
 }
